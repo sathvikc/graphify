@@ -172,6 +172,32 @@ BACKENDS: dict[str, dict] = {
         # CLI's Read tool rather than as inline base64 (see `_call_claude_cli`).
         "vision": True,
     },
+    "copilot-cli": {
+        # Routes through the GitHub Copilot subscription by exchanging a `gh` CLI
+        # OAuth token for a short-lived Copilot session token, then calling the
+        # OpenAI-compatible https://api.githubcopilot.com endpoint.  No separate
+        # API key purchase required — costs are billed to the user's Copilot plan.
+        "default_model": os.environ.get("GRAPHIFY_COPILOT_CLI_MODEL", "gpt-4o"),
+        "model_env_key": "GRAPHIFY_COPILOT_CLI_MODEL",
+        "pricing": {"input": 0.0, "output": 0.0},
+        "temperature": 0,
+        "max_tokens": 8192,
+        "vision": True,
+    },
+    "copilot": {
+        # GitHub Models API (https://models.inference.ai.azure.com) authenticated
+        # via GITHUB_TOKEN.  Deliberately excluded from detect_backend() auto-
+        # detection: GITHUB_TOKEN is ambient in every GitHub Actions runner so
+        # auto-detecting on it would silently reroute CI corpora (see F-002/F-029).
+        "base_url": os.environ.get("GITHUB_MODELS_BASE_URL", "https://models.inference.ai.azure.com"),
+        "default_model": os.environ.get("GITHUB_COPILOT_MODEL", "gpt-4o-mini"),
+        "env_key": "GITHUB_TOKEN",
+        "model_env_key": "GRAPHIFY_COPILOT_MODEL",
+        "pricing": {"input": 0.0, "output": 0.0},
+        "temperature": 0,
+        "max_tokens": 16384,
+        "vision": True,
+    },
 }
 
 
@@ -1216,6 +1242,113 @@ def _call_claude_cli(user_message: str, max_tokens: int = 8192, *, deep_mode: bo
     return result
 
 
+def _call_copilot_cli(
+    user_message: str,
+    max_tokens: int = 8192,
+    *,
+    deep_mode: bool = False,
+    images: list[_ImageRef] | None = None,
+) -> dict:
+    """Call GitHub Copilot via the `gh` CLI OAuth token exchange.
+
+    Authenticates by exchanging the GitHub OAuth token (from `gh auth token`)
+    for a short-lived Copilot session token at the copilot_internal endpoint,
+    then calls the OpenAI-compatible https://api.githubcopilot.com endpoint.
+    Bills to the user's GitHub Copilot subscription; no separate API key needed.
+    """
+    import shutil
+    import subprocess
+    import urllib.error
+    import urllib.request
+
+    if shutil.which("gh") is None:
+        raise RuntimeError(
+            "GitHub CLI (gh) not found on $PATH. Install from https://cli.github.com/ "
+            "and run `gh auth login` to authenticate."
+        )
+
+    gh_proc = subprocess.run(
+        ["gh", "auth", "token"],
+        capture_output=True, text=True, check=False,
+    )
+    if gh_proc.returncode != 0:
+        raise RuntimeError(
+            f"gh auth token failed (exit {gh_proc.returncode}): {gh_proc.stderr.strip()[:300]}"
+        )
+    gh_token = gh_proc.stdout.strip()
+    if not gh_token:
+        raise RuntimeError(
+            "gh auth token returned an empty token. Run `gh auth login` first."
+        )
+
+    token_url = "https://api.github.com/copilot_internal/v2/token"
+    req = urllib.request.Request(
+        token_url,
+        headers={
+            "Authorization": f"token {gh_token}",
+            "Accept": "application/json",
+            "Copilot-Integration-Id": "graphify",
+            "Editor-Version": "graphify/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            payload = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(
+            f"Copilot token exchange failed: {exc.code} {exc.reason}. "
+            "Ensure your GitHub account has an active Copilot subscription."
+        ) from exc
+
+    copilot_token = payload.get("token", "")
+    if not copilot_token:
+        raise RuntimeError(
+            "Copilot token exchange returned no token field. "
+            "Check your Copilot subscription status."
+        )
+
+    try:
+        from openai import OpenAI
+    except ImportError as exc:
+        raise ImportError(
+            "copilot-cli backend requires the openai package. Run: pip install openai"
+        ) from exc
+
+    mdl = os.environ.get("GRAPHIFY_COPILOT_CLI_MODEL", "").strip() or BACKENDS["copilot-cli"]["default_model"]
+    client = OpenAI(
+        api_key=copilot_token,
+        base_url="https://api.githubcopilot.com",
+        timeout=_resolve_api_timeout(),
+        max_retries=_resolve_max_retries(),
+    )
+    content_parts = _openai_content(user_message, images or [])
+    resp = client.chat.completions.create(
+        model=mdl,
+        messages=[
+            {"role": "system", "content": _extraction_system(deep=deep_mode)},
+            {"role": "user", "content": content_parts},
+        ],
+        max_tokens=max_tokens,
+        temperature=0,
+        stream=False,
+    )
+
+    raw_content = resp.choices[0].message.content if resp.choices else ""
+    result = _parse_llm_json(raw_content or "{}")
+    result["input_tokens"] = resp.usage.prompt_tokens if resp.usage else 0
+    result["output_tokens"] = resp.usage.completion_tokens if resp.usage else 0
+    result["model"] = mdl
+    result["finish_reason"] = resp.choices[0].finish_reason if resp.choices else "stop"
+    if _response_is_hollow(raw_content, result) and result["finish_reason"] != "length":
+        print(
+            "[graphify] copilot-cli returned a hollow response; treating as "
+            "truncation so adaptive retry can bisect the chunk.",
+            file=sys.stderr,
+        )
+        result["finish_reason"] = "length"
+    return result
+
+
 def _azure_client(api_key: str, endpoint: str):
     """Construct an AzureOpenAI client with env-driven api_version and timeout."""
     try:
@@ -1372,7 +1505,7 @@ def extract_files_direct(
             file=sys.stderr,
         )
         key = "ollama"
-    if not key and backend not in ("bedrock", "claude-cli"):
+    if not key and backend not in ("bedrock", "claude-cli", "copilot-cli"):
         raise ValueError(
             f"No API key for backend '{backend}'. "
             f"Set {_format_backend_env_keys(backend)} or pass api_key=."
@@ -1396,6 +1529,8 @@ def extract_files_direct(
         return _call_claude(key, mdl, user_msg, max_tokens=max_out, deep_mode=deep_mode, images=image_refs)
     if backend == "claude-cli":
         return _call_claude_cli(user_msg, max_tokens=max_out, deep_mode=deep_mode, images=image_refs)
+    if backend == "copilot-cli":
+        return _call_copilot_cli(user_msg, max_tokens=max_out, deep_mode=deep_mode, images=image_refs)
     if backend == "bedrock":
         return _call_bedrock(mdl, user_msg, max_tokens=max_out, deep_mode=deep_mode, images=image_refs)
     if backend == "azure":
@@ -1816,6 +1951,10 @@ def extract_corpus_parallel(
     # over session state. Force serial unless the user explicitly opts in.
     if backend == "claude-cli" and os.environ.get("GRAPHIFY_CLAUDE_CLI_PARALLEL", "").strip() != "1":
         max_concurrency = 1
+    # copilot-cli exchanges a short-lived session token per call; parallel requests
+    # race on the same token. Force serial unless the user opts in.
+    if backend == "copilot-cli" and os.environ.get("GRAPHIFY_COPILOT_CLI_PARALLEL", "").strip() != "1":
+        max_concurrency = 1
     workers = max(1, min(max_concurrency, total))
     if workers == 1:
         # Avoid thread pool overhead for single-worker runs (and keep
@@ -1894,7 +2033,7 @@ def _call_llm(
         ollama_url = os.environ.get("OLLAMA_BASE_URL", cfg.get("base_url", ""))
         _validate_ollama_base_url(ollama_url)
         key = "ollama"
-    if not key and backend not in ("bedrock", "claude-cli"):
+    if not key and backend not in ("bedrock", "claude-cli", "copilot-cli"):
         raise ValueError(
             f"No API key for backend '{backend}'. Set {_format_backend_env_keys(backend)}."
         )
@@ -1946,6 +2085,61 @@ def _call_llm(
         envelope = _claude_cli_envelope(proc.stdout)
         return envelope.get("result", "")
 
+    if backend == "copilot-cli":
+        import shutil
+        import subprocess
+        import urllib.error
+        import urllib.request
+
+        if shutil.which("gh") is None:
+            raise RuntimeError("GitHub CLI (gh) not found on $PATH")
+        gh_proc = subprocess.run(
+            ["gh", "auth", "token"], capture_output=True, text=True, check=False,
+        )
+        if gh_proc.returncode != 0:
+            raise RuntimeError(
+                f"gh auth token failed (exit {gh_proc.returncode}): {gh_proc.stderr.strip()[:300]}"
+            )
+        gh_token = gh_proc.stdout.strip()
+        if not gh_token:
+            raise RuntimeError("gh auth token returned an empty token. Run `gh auth login` first.")
+        req = urllib.request.Request(
+            "https://api.github.com/copilot_internal/v2/token",
+            headers={
+                "Authorization": f"token {gh_token}",
+                "Accept": "application/json",
+                "Copilot-Integration-Id": "graphify",
+                "Editor-Version": "graphify/1.0",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req) as _resp:
+                _payload = json.loads(_resp.read())
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(
+                f"Copilot token exchange failed: {exc.code} {exc.reason}."
+            ) from exc
+        copilot_token = _payload.get("token", "")
+        if not copilot_token:
+            raise RuntimeError("Copilot token exchange returned no token field.")
+        try:
+            from openai import OpenAI as _OAI
+        except ImportError as exc:
+            raise ImportError("copilot-cli backend requires the openai package.") from exc
+        _client = _OAI(
+            api_key=copilot_token,
+            base_url="https://api.githubcopilot.com",
+            timeout=_resolve_api_timeout(),
+            max_retries=_resolve_max_retries(),
+        )
+        _resp2 = _client.chat.completions.create(
+            model=mdl,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+            temperature=0,
+            stream=False,
+        )
+        return _resp2.choices[0].message.content or "" if _resp2.choices else ""
 
     if backend == "bedrock":
         try:
@@ -2121,7 +2315,13 @@ def detect_backend() -> str | None:
         _validate_ollama_base_url(ollama_url)
         return "ollama"
     for name in BACKENDS:
-        if name not in ("gemini", "kimi", "claude", "openai", "deepseek", "azure", "bedrock", "ollama", "claude-cli"):
+        if name not in (
+            "gemini", "kimi", "claude", "openai", "deepseek", "azure", "bedrock", "ollama",
+            "claude-cli", "copilot-cli",
+            # copilot excluded: GITHUB_TOKEN is ambient in every GitHub Actions runner
+            # so auto-detecting it would silently reroute CI corpora (see F-002/F-029).
+            "copilot",
+        ):
             if _get_backend_api_key(name):
                 return name
     return None
@@ -2305,6 +2505,8 @@ def label_communities(
     if backend == "ollama" and os.environ.get("GRAPHIFY_OLLAMA_PARALLEL", "").strip() != "1":
         max_concurrency = 1
     if backend == "claude-cli" and os.environ.get("GRAPHIFY_CLAUDE_CLI_PARALLEL", "").strip() != "1":
+        max_concurrency = 1
+    if backend == "copilot-cli" and os.environ.get("GRAPHIFY_COPILOT_CLI_PARALLEL", "").strip() != "1":
         max_concurrency = 1
     workers = max(1, min(max_concurrency, n_batches))
 

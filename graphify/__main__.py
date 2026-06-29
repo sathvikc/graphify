@@ -2259,13 +2259,13 @@ def main() -> None:
         print("    --no-label              keep 'Community N' placeholders (skip LLM community naming)")
         print("    --backend=<name>        backend to use for community naming (default: auto-detect)")
         print("    --model=<name>          model to use for community naming")
-        print("    --max-concurrency=N     parallel community-labeling LLM calls (default 4; forced to 1 for ollama/claude-cli)")
+        print("    --max-concurrency=N     parallel community-labeling LLM calls (default 4; forced to 1 for ollama/claude-cli/copilot-cli)")
         print("    --batch-size=N          communities per labeling LLM call (default 100)")
         print("  label <path>            (re)name communities with the configured LLM backend, regenerate report")
         print("    --missing-only         keep existing labels and only name missing/placeholder communities")
         print("    --backend=<name>        backend to use (default: auto-detect from API keys)")
         print("    --model=<name>          model to use for community naming")
-        print("    --max-concurrency=N     parallel labeling LLM calls (default 4; forced to 1 for ollama/claude-cli)")
+        print("    --max-concurrency=N     parallel labeling LLM calls (default 4; forced to 1 for ollama/claude-cli/copilot-cli)")
         print("    --batch-size=N          communities per labeling LLM call (default 100)")
         print("  query \"<question>\"       BFS traversal of graph.json for a question")
         print("    --dfs                   use depth-first instead of breadth-first")
@@ -4514,6 +4514,16 @@ def main() -> None:
                         print(
                             "error: backend 'claude-cli' requires the `claude` CLI on $PATH "
                             "(install Claude Code and run `claude` once to authenticate).",
+                            file=sys.stderr,
+                        )
+                        sys.exit(1)
+                elif backend == "copilot-cli":
+                    import shutil as _shutil
+                    allow_no_key = _shutil.which("gh") is not None
+                    if not allow_no_key:
+                        print(
+                            "error: backend 'copilot-cli' requires the `gh` CLI on $PATH "
+                            "(install from https://cli.github.com/ and run `gh auth login`).",
                             file=sys.stderr,
                         )
                         sys.exit(1)
