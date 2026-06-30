@@ -173,10 +173,11 @@ BACKENDS: dict[str, dict] = {
         "vision": True,
     },
     "copilot-cli": {
-        # Routes through the GitHub Copilot subscription by exchanging a `gh` CLI
-        # OAuth token for a short-lived Copilot session token, then calling the
-        # OpenAI-compatible https://api.githubcopilot.com endpoint.  No separate
-        # API key purchase required — costs are billed to the user's Copilot plan.
+        # Shells out to the standalone `copilot` CLI binary with --output-format
+        # json.  The extraction system prompt is injected via
+        # COPILOT_CUSTOM_INSTRUCTIONS_DIRS (workaround for the missing
+        # --system-prompt flag).  Auth is handled by the copilot binary itself
+        # using the user's Copilot subscription; no separate API key needed.
         "default_model": os.environ.get("GRAPHIFY_COPILOT_CLI_MODEL", "gpt-4o"),
         "model_env_key": "GRAPHIFY_COPILOT_CLI_MODEL",
         "pricing": {"input": 0.0, "output": 0.0},
@@ -1129,6 +1130,60 @@ def _claude_cli_envelope(stdout: str) -> dict:
     return envelope
 
 
+def _copilot_cli_parse_jsonl(stdout: str) -> tuple[str, dict]:
+    """Parse JSONL output from `copilot -p --output-format json`.
+
+    Each output line is a JSON object. Returns (response_text, usage_dict) where
+    usage_dict has optional input_tokens, output_tokens, and finish_reason keys.
+    """
+    lines = [ln for ln in stdout.splitlines() if ln.strip()]
+    if not lines:
+        raise RuntimeError(
+            "copilot -p produced no output. "
+            "Ensure the `copilot` CLI is installed and authenticated "
+            "(run `copilot auth login`)."
+        )
+
+    content = ""
+    usage: dict = {}
+
+    for line in lines:
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+
+        # Extract assistant response — try common field names
+        for field in ("content", "message", "text", "response"):
+            val = obj.get(field)
+            if isinstance(val, str) and val.strip():
+                content = val
+                break
+
+        # Extract token usage — handle both camelCase and snake_case
+        obj_usage = obj.get("usage") or {}
+        if isinstance(obj_usage, dict):
+            pt = obj_usage.get("promptTokens") or obj_usage.get("prompt_tokens") or 0
+            ct = obj_usage.get("completionTokens") or obj_usage.get("completion_tokens") or 0
+            if pt:
+                usage["input_tokens"] = int(pt)
+            if ct:
+                usage["output_tokens"] = int(ct)
+
+        # Extract finish reason — handle both camelCase and snake_case
+        fr = obj.get("finishReason") or obj.get("finish_reason") or obj.get("stop_reason")
+        if fr:
+            usage["finish_reason"] = "length" if fr in ("max_tokens", "length") else "stop"
+
+    if not content:
+        # Fallback: treat raw stdout as response if JSON parsing yielded nothing
+        content = stdout.strip()
+
+    return content, usage
+
+
 def _call_claude_cli(user_message: str, max_tokens: int = 8192, *, deep_mode: bool = False, images: list[_ImageRef] | None = None) -> dict:
     """Call Claude via the locally-installed Claude Code CLI (`claude -p`).
 
@@ -1249,96 +1304,71 @@ def _call_copilot_cli(
     deep_mode: bool = False,
     images: list[_ImageRef] | None = None,
 ) -> dict:
-    """Call GitHub Copilot via the `gh` CLI OAuth token exchange.
+    """Call GitHub Copilot via the standalone `copilot` CLI binary.
 
-    Authenticates by exchanging the GitHub OAuth token (from `gh auth token`)
-    for a short-lived Copilot session token at the copilot_internal endpoint,
-    then calls the OpenAI-compatible https://api.githubcopilot.com endpoint.
-    Bills to the user's GitHub Copilot subscription; no separate API key needed.
+    Injects graphify's extraction system prompt via COPILOT_CUSTOM_INSTRUCTIONS_DIRS
+    (the CLI's workaround for the missing --system-prompt flag) and runs
+    `copilot -p <message> --output-format json --silent`. Auth is handled by
+    the copilot CLI itself using the user's Copilot subscription; no API key needed.
     """
     import shutil
     import subprocess
-    import urllib.error
-    import urllib.request
+    import tempfile
 
-    if shutil.which("gh") is None:
+    if shutil.which("copilot") is None:
         raise RuntimeError(
-            "GitHub CLI (gh) not found on $PATH. Install from https://cli.github.com/ "
-            "and run `gh auth login` to authenticate."
+            "GitHub Copilot CLI not found on $PATH. Install from "
+            "https://github.com/github/gh-copilot and run `copilot auth login` "
+            "to authenticate."
         )
 
-    gh_proc = subprocess.run(
-        ["gh", "auth", "token"],
-        capture_output=True, text=True, check=False,
-    )
-    if gh_proc.returncode != 0:
-        raise RuntimeError(
-            f"gh auth token failed (exit {gh_proc.returncode}): {gh_proc.stderr.strip()[:300]}"
-        )
-    gh_token = gh_proc.stdout.strip()
-    if not gh_token:
-        raise RuntimeError(
-            "gh auth token returned an empty token. Run `gh auth login` first."
-        )
+    attach_args: list[str] = []
+    if images:
+        for img in images:
+            attach_args.extend(["--attachment", str(img.path)])
 
-    token_url = "https://api.github.com/copilot_internal/v2/token"
-    req = urllib.request.Request(
-        token_url,
-        headers={
-            "Authorization": f"token {gh_token}",
-            "Accept": "application/json",
-            "Copilot-Integration-Id": "graphify",
-            "Editor-Version": "graphify/1.0",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req) as resp:
-            payload = json.loads(resp.read())
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(
-            f"Copilot token exchange failed: {exc.code} {exc.reason}. "
-            "Ensure your GitHub account has an active Copilot subscription."
-        ) from exc
+    copilot_model = os.environ.get("GRAPHIFY_COPILOT_CLI_MODEL", "").strip()
 
-    copilot_token = payload.get("token", "")
-    if not copilot_token:
-        raise RuntimeError(
-            "Copilot token exchange returned no token field. "
-            "Check your Copilot subscription status."
+    with tempfile.TemporaryDirectory() as inst_dir:
+        # Inject system prompt via COPILOT_CUSTOM_INSTRUCTIONS_DIRS — the
+        # copilot CLI reads markdown files from this directory and prepends
+        # them as custom instructions, standing in for --system-prompt.
+        Path(inst_dir, "graphify.md").write_text(
+            _extraction_system(deep=deep_mode), encoding="utf-8"
+        )
+        env = {**os.environ, "COPILOT_CUSTOM_INSTRUCTIONS_DIRS": inst_dir}
+        if copilot_model:
+            env["COPILOT_MODEL"] = copilot_model
+
+        cli_args = [
+            "copilot", "-p", user_message,
+            "--output-format", "json",
+            "--silent",
+            *attach_args,
+        ]
+        proc = subprocess.run(
+            cli_args,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_resolve_api_timeout(),
+            check=False,
+            env=env,
+            **_no_window_kwargs(),
         )
 
-    try:
-        from openai import OpenAI
-    except ImportError as exc:
-        raise ImportError(
-            "copilot-cli backend requires the openai package. Run: pip install openai"
-        ) from exc
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"copilot -p exited {proc.returncode}: {proc.stderr.strip()[:500]}"
+        )
 
-    mdl = os.environ.get("GRAPHIFY_COPILOT_CLI_MODEL", "").strip() or BACKENDS["copilot-cli"]["default_model"]
-    client = OpenAI(
-        api_key=copilot_token,
-        base_url="https://api.githubcopilot.com",
-        timeout=_resolve_api_timeout(),
-        max_retries=_resolve_max_retries(),
-    )
-    content_parts = _openai_content(user_message, images or [])
-    resp = client.chat.completions.create(
-        model=mdl,
-        messages=[
-            {"role": "system", "content": _extraction_system(deep=deep_mode)},
-            {"role": "user", "content": content_parts},
-        ],
-        max_tokens=max_tokens,
-        temperature=0,
-        stream=False,
-    )
-
-    raw_content = resp.choices[0].message.content if resp.choices else ""
+    raw_content, usage = _copilot_cli_parse_jsonl(proc.stdout)
     result = _parse_llm_json(raw_content or "{}")
-    result["input_tokens"] = resp.usage.prompt_tokens if resp.usage else 0
-    result["output_tokens"] = resp.usage.completion_tokens if resp.usage else 0
-    result["model"] = mdl
-    result["finish_reason"] = resp.choices[0].finish_reason if resp.choices else "stop"
+    result["input_tokens"] = usage.get("input_tokens", 0)
+    result["output_tokens"] = usage.get("output_tokens", 0)
+    result["model"] = copilot_model or BACKENDS["copilot-cli"]["default_model"]
+    result["finish_reason"] = usage.get("finish_reason", "stop")
     if _response_is_hollow(raw_content, result) and result["finish_reason"] != "length":
         print(
             "[graphify] copilot-cli returned a hollow response; treating as "
@@ -1951,8 +1981,8 @@ def extract_corpus_parallel(
     # over session state. Force serial unless the user explicitly opts in.
     if backend == "claude-cli" and os.environ.get("GRAPHIFY_CLAUDE_CLI_PARALLEL", "").strip() != "1":
         max_concurrency = 1
-    # copilot-cli exchanges a short-lived session token per call; parallel requests
-    # race on the same token. Force serial unless the user opts in.
+    # copilot-cli shells out to the copilot binary; concurrent subprocesses can
+    # hit rate limits or auth contention. Force serial unless the user opts in.
     if backend == "copilot-cli" and os.environ.get("GRAPHIFY_COPILOT_CLI_PARALLEL", "").strip() != "1":
         max_concurrency = 1
     workers = max(1, min(max_concurrency, total))
@@ -2088,58 +2118,25 @@ def _call_llm(
     if backend == "copilot-cli":
         import shutil
         import subprocess
-        import urllib.error
-        import urllib.request
 
-        if shutil.which("gh") is None:
-            raise RuntimeError("GitHub CLI (gh) not found on $PATH")
-        gh_proc = subprocess.run(
-            ["gh", "auth", "token"], capture_output=True, text=True, check=False,
-        )
-        if gh_proc.returncode != 0:
-            raise RuntimeError(
-                f"gh auth token failed (exit {gh_proc.returncode}): {gh_proc.stderr.strip()[:300]}"
-            )
-        gh_token = gh_proc.stdout.strip()
-        if not gh_token:
-            raise RuntimeError("gh auth token returned an empty token. Run `gh auth login` first.")
-        req = urllib.request.Request(
-            "https://api.github.com/copilot_internal/v2/token",
-            headers={
-                "Authorization": f"token {gh_token}",
-                "Accept": "application/json",
-                "Copilot-Integration-Id": "graphify",
-                "Editor-Version": "graphify/1.0",
-            },
-        )
-        try:
-            with urllib.request.urlopen(req) as _resp:
-                _payload = json.loads(_resp.read())
-        except urllib.error.HTTPError as exc:
-            raise RuntimeError(
-                f"Copilot token exchange failed: {exc.code} {exc.reason}."
-            ) from exc
-        copilot_token = _payload.get("token", "")
-        if not copilot_token:
-            raise RuntimeError("Copilot token exchange returned no token field.")
-        try:
-            from openai import OpenAI as _OAI
-        except ImportError as exc:
-            raise ImportError("copilot-cli backend requires the openai package.") from exc
-        _client = _OAI(
-            api_key=copilot_token,
-            base_url="https://api.githubcopilot.com",
+        if shutil.which("copilot") is None:
+            raise RuntimeError("GitHub Copilot CLI not found on $PATH")
+        proc = subprocess.run(
+            ["copilot", "-p", prompt, "--output-format", "json", "--silent"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=_resolve_api_timeout(),
-            max_retries=_resolve_max_retries(),
+            check=False,
+            **_no_window_kwargs(),
         )
-        _resp2 = _client.chat.completions.create(
-            model=mdl,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=max_tokens,
-            temperature=0,
-            stream=False,
-        )
-        return _resp2.choices[0].message.content or "" if _resp2.choices else ""
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"copilot -p exited {proc.returncode}: {proc.stderr.strip()[:500]}"
+            )
+        content, _ = _copilot_cli_parse_jsonl(proc.stdout)
+        return content
 
     if backend == "bedrock":
         try:
@@ -2499,8 +2496,9 @@ def label_communities(
 
     # Mirror extract_corpus_parallel's backend guards: Ollama serves one request at
     # a time per loaded model (parallel batches cause VRAM pressure and hollow
-    # replies, #798) and claude-cli shells out to a single Claude Code session that
-    # parallel subprocesses corrupt. Force serial for these unless the user opts in
+    # replies, #798); claude-cli shells out to a single Claude Code session that
+    # parallel subprocesses corrupt; copilot-cli can hit rate limits or auth
+    # contention under concurrency. Force serial for these unless the user opts in
     # via the same env switches.
     if backend == "ollama" and os.environ.get("GRAPHIFY_OLLAMA_PARALLEL", "").strip() != "1":
         max_concurrency = 1

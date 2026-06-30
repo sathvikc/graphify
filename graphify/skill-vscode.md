@@ -668,12 +668,14 @@ When the user asks to install the post-commit auto-rebuild hook or wire graphify
 
 graphify can use your GitHub Copilot subscription for semantic extraction — no separate API key purchase required.
 
-**`copilot-cli`** — exchanges a `gh` CLI OAuth token for a short-lived Copilot session token automatically, billing to your Copilot subscription:
+**`copilot-cli`** — shells out to the standalone `copilot` CLI binary, injecting graphify's extraction prompt via `COPILOT_CUSTOM_INSTRUCTIONS_DIRS`. Auth is handled by the CLI itself:
 
 ```bash
-gh auth login                           # one-time; any scope is sufficient
+copilot auth login                      # one-time authentication
 graphify extract . --backend copilot-cli
 ```
+
+Override the model with `GRAPHIFY_COPILOT_CLI_MODEL` (passed as `COPILOT_MODEL` to the subprocess). Set `GRAPHIFY_COPILOT_CLI_PARALLEL=1` to allow concurrent extraction (serial by default to avoid rate-limit contention).
 
 **`copilot`** — authenticates via `GITHUB_TOKEN` against the GitHub Models API (requires a PAT with models permission or an org-provisioned token):
 
@@ -690,7 +692,7 @@ backend = llm.detect_backend()          # auto-detects Gemini/OpenAI/etc. from e
 if backend is None:
     if os.environ.get("GITHUB_TOKEN"):
         backend = "copilot"
-    elif shutil.which("gh"):
+    elif shutil.which("copilot"):
         backend = "copilot-cli"
 # pass backend= to extract_corpus_parallel / label_communities as needed
 ```

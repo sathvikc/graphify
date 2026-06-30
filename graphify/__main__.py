@@ -4519,11 +4519,12 @@ def main() -> None:
                         sys.exit(1)
                 elif backend == "copilot-cli":
                     import shutil as _shutil
-                    allow_no_key = _shutil.which("gh") is not None
+                    allow_no_key = _shutil.which("copilot") is not None
                     if not allow_no_key:
                         print(
-                            "error: backend 'copilot-cli' requires the `gh` CLI on $PATH "
-                            "(install from https://cli.github.com/ and run `gh auth login`).",
+                            "error: backend 'copilot-cli' requires the `copilot` CLI on $PATH "
+                            "(install from https://github.com/github/gh-copilot and run "
+                            "`copilot auth login`).",
                             file=sys.stderr,
                         )
                         sys.exit(1)
